@@ -250,10 +250,9 @@ export function createReadToolDefinition(
 							if (mimeType) {
 								// Read image as binary.
 								const buffer = await ops.readFile(absolutePath);
-								const base64 = buffer.toString("base64");
 								if (autoResizeImages) {
 									// Resize image if needed before sending it back to the model.
-									const resized = await resizeImage({ type: "image", data: base64, mimeType });
+									const resized = await resizeImage(buffer, mimeType);
 									if (!resized) {
 										let textNote = `Read image file [${mimeType}]\n[Image omitted: could not be resized below the inline image size limit.]`;
 										if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
@@ -273,7 +272,7 @@ export function createReadToolDefinition(
 									if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
 									content = [
 										{ type: "text", text: textNote },
-										{ type: "image", data: base64, mimeType },
+										{ type: "image", data: buffer.toString("base64"), mimeType },
 									];
 								}
 							} else {

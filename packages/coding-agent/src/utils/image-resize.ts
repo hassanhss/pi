@@ -1,4 +1,3 @@
-import type { ImageContent } from "@earendil-works/pi-ai";
 import { applyExifOrientation } from "./exif-orientation.js";
 import { loadPhoton } from "./photon.js";
 
@@ -57,10 +56,13 @@ function encodeCandidate(buffer: Uint8Array, mimeType: string): EncodedCandidate
  * 3. If still too large, try JPEG with decreasing quality
  * 4. If still too large, progressively reduce dimensions until 1x1
  */
-export async function resizeImage(img: ImageContent, options?: ImageResizeOptions): Promise<ResizedImage | null> {
+export async function resizeImage(
+	inputBytes: Uint8Array,
+	mimeType: string,
+	options?: ImageResizeOptions,
+): Promise<ResizedImage | null> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
-	const inputBuffer = Buffer.from(img.data, "base64");
-	const inputBase64Size = Buffer.byteLength(img.data, "utf-8");
+	const inputBase64Size = Math.ceil(inputBytes.byteLength / 3) * 4;
 
 	const photon = await loadPhoton();
 	if (!photon) {
@@ -69,20 +71,19 @@ export async function resizeImage(img: ImageContent, options?: ImageResizeOption
 
 	let image: ReturnType<typeof photon.PhotonImage.new_from_byteslice> | undefined;
 	try {
-		const inputBytes = new Uint8Array(inputBuffer);
 		const rawImage = photon.PhotonImage.new_from_byteslice(inputBytes);
 		image = applyExifOrientation(photon, rawImage, inputBytes);
 		if (image !== rawImage) rawImage.free();
 
 		const originalWidth = image.get_width();
 		const originalHeight = image.get_height();
-		const format = img.mimeType?.split("/")[1] ?? "png";
+		const format = mimeType.split("/")[1] ?? "png";
 
 		// Check if already within all limits (dimensions AND encoded size)
 		if (originalWidth <= opts.maxWidth && originalHeight <= opts.maxHeight && inputBase64Size < opts.maxBytes) {
 			return {
-				data: img.data,
-				mimeType: img.mimeType ?? `image/${format}`,
+				data: Buffer.from(inputBytes).toString("base64"),
+				mimeType: mimeType || `image/${format}`,
 				originalWidth,
 				originalHeight,
 				width: originalWidth,
