@@ -1,7 +1,54 @@
 import assert from "node:assert";
 import { describe, it, mock } from "node:test";
 import { setKittyProtocolActive } from "../src/keys.ts";
-import { normalizeAppleTerminalInput, ProcessTerminal } from "../src/terminal.ts";
+import {
+	normalizeAppleTerminalInput,
+	normalizeNativeShiftEnterInput,
+	ProcessTerminal,
+	resolveEscapeTimeoutMs,
+} from "../src/terminal.ts";
+
+describe("resolveEscapeTimeoutMs", () => {
+	it("uses PI_TUI_ESC_TIMEOUT when configured", () => {
+		assert.equal(resolveEscapeTimeoutMs({ PI_TUI_ESC_TIMEOUT: "80" }), 80);
+		assert.equal(resolveEscapeTimeoutMs({ PI_TUI_ESC_TIMEOUT: "80", SSH_TTY: "/dev/pts/1" }), 80);
+	});
+
+	it("ignores invalid PI_TUI_ESC_TIMEOUT values", () => {
+		assert.equal(resolveEscapeTimeoutMs({ PI_TUI_ESC_TIMEOUT: "abc" }), 10);
+		assert.equal(resolveEscapeTimeoutMs({ PI_TUI_ESC_TIMEOUT: "0" }), 10);
+		assert.equal(resolveEscapeTimeoutMs({ PI_TUI_ESC_TIMEOUT: "-5" }), 10);
+		assert.equal(resolveEscapeTimeoutMs({ PI_TUI_ESC_TIMEOUT: "" }), 10);
+	});
+
+	it("defaults to 100ms over SSH", () => {
+		assert.equal(resolveEscapeTimeoutMs({ SSH_CONNECTION: "10.0.0.1 22" }), 100);
+		assert.equal(resolveEscapeTimeoutMs({ SSH_TTY: "/dev/pts/1" }), 100);
+	});
+
+	it("defaults to 10ms otherwise", () => {
+		assert.equal(resolveEscapeTimeoutMs({}), 10);
+	});
+});
+
+describe("normalizeNativeShiftEnterInput", () => {
+	it("rewrites Return to CSI-u Shift+Enter when native Shift detection is enabled and Shift is pressed", () => {
+		assert.equal(normalizeNativeShiftEnterInput("\r", true, true), "\x1b[13;2u");
+	});
+
+	it("leaves Return unchanged when native Shift detection is disabled", () => {
+		assert.equal(normalizeNativeShiftEnterInput("\r", false, true), "\r");
+	});
+
+	it("leaves Return unchanged when Shift is not pressed", () => {
+		assert.equal(normalizeNativeShiftEnterInput("\r", true, false), "\r");
+	});
+
+	it("leaves non-Return input unchanged", () => {
+		assert.equal(normalizeNativeShiftEnterInput("\x1b[13;2u", true, true), "\x1b[13;2u");
+		assert.equal(normalizeNativeShiftEnterInput("a", true, true), "a");
+	});
+});
 
 describe("normalizeAppleTerminalInput", () => {
 	it("rewrites Apple Terminal Return to CSI-u Shift+Enter when Shift is pressed", () => {
@@ -82,58 +129,80 @@ describe("ProcessTerminal Kitty keyboard protocol negotiation", () => {
 		};
 	}
 
-	it("activates Kitty mode for non-zero negotiated flags", () => {
-		mock.timers.enable({ apis: ["setTimeout"] });
+	it("queries Kitty mode before enabling modifyOtherKeys fallback", () => {
 		const harness = setupNegotiation();
 		try {
-			harness.send("\x1b[?1u");
-			mock.timers.tick(150);
-
 			assert.equal(harness.writes[0], "\x1b[>7u\x1b[?u\x1b[c");
 			assert.equal(harness.writes.includes("\x1b[>4;2m"), false);
+			assert.equal(harness.terminal.kittyProtocolActive, false);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("activates Kitty mode for non-zero negotiated flags", () => {
+		const harness = setupNegotiation();
+		try {
+			harness.send("\x1b[?7u");
+
 			assert.equal(harness.getInput(), undefined);
 			assert.equal(harness.terminal.kittyProtocolActive, true);
+			assert.equal(harness.writes.includes("\x1b[>4;2m"), false);
+			assert.equal(harness.writes.includes("\x1b[>4;0m"), false);
 
 			harness.cleanup();
 			assert.equal(harness.writes.filter((write) => write === "\x1b[<u").length, 1);
+			assert.equal(harness.writes.includes("\x1b[>4;0m"), false);
 		} finally {
 			harness.cleanup();
-			mock.timers.reset();
 		}
 	});
 
-	it("falls back to modifyOtherKeys for unsupported or silent terminals", () => {
-		const unsupported = setupNegotiation();
+	it("falls back to modifyOtherKeys for zero Kitty flags", () => {
+		const harness = setupNegotiation();
 		try {
-			unsupported.send("\x1b[?62;4;52c");
+			harness.send("\x1b[?0u");
 
-			assert.equal(unsupported.writes[0], "\x1b[>7u\x1b[?u\x1b[c");
-			assert.equal(unsupported.writes.includes("\x1b[>4;2m"), true);
-			assert.equal(unsupported.getInput(), undefined);
-			assert.equal(unsupported.terminal.kittyProtocolActive, false);
+			assert.equal(harness.getInput(), undefined);
+			assert.equal(harness.terminal.kittyProtocolActive, false);
+			assert.equal(harness.writes.filter((write) => write === "\x1b[>4;2m").length, 1);
+
+			harness.cleanup();
+			assert.equal(harness.writes.filter((write) => write === "\x1b[>4;0m").length, 1);
 		} finally {
-			unsupported.cleanup();
-		}
-
-		mock.timers.enable({ apis: ["setTimeout"] });
-		const silent = setupNegotiation();
-		try {
-			mock.timers.tick(150);
-
-			assert.equal(silent.writes[0], "\x1b[>7u\x1b[?u\x1b[c");
-			assert.equal(silent.writes.includes("\x1b[>4;2m"), true);
-			assert.equal(silent.terminal.kittyProtocolActive, false);
-		} finally {
-			silent.cleanup();
-			mock.timers.reset();
+			harness.cleanup();
 		}
 	});
 
-	it("tracks late split Kitty confirmation after fallback", () => {
+	it("falls back to modifyOtherKeys for device attributes without Kitty flags", () => {
+		const harness = setupNegotiation();
+		try {
+			harness.send("\x1b[?62;4;52c");
+
+			assert.equal(harness.getInput(), undefined);
+			assert.equal(harness.terminal.kittyProtocolActive, false);
+			assert.equal(harness.writes.filter((write) => write === "\x1b[>4;2m").length, 1);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("forwards normal input while waiting for Kitty response", () => {
+		const harness = setupNegotiation();
+		try {
+			harness.send("a");
+
+			assert.equal(harness.getInput(), "a");
+			assert.equal(harness.terminal.kittyProtocolActive, false);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("tracks split Kitty confirmation", () => {
 		mock.timers.enable({ apis: ["setTimeout"] });
 		const harness = setupNegotiation();
 		try {
-			mock.timers.tick(150);
 			harness.send("\x1b[?7");
 			mock.timers.tick(10);
 
@@ -141,26 +210,21 @@ describe("ProcessTerminal Kitty keyboard protocol negotiation", () => {
 
 			harness.send("u");
 
-			assert.equal(harness.writes.includes("\x1b[>4;2m"), true);
 			assert.equal(harness.terminal.kittyProtocolActive, true);
-
-			harness.cleanup();
-			assert.equal(harness.writes.filter((write) => write === "\x1b[<u").length, 1);
-			assert.equal(harness.writes.filter((write) => write === "\x1b[>4;0m").length, 1);
+			assert.equal(harness.writes.includes("\x1b[>4;2m"), false);
 		} finally {
 			harness.cleanup();
 			mock.timers.reset();
 		}
 	});
 
-	it("replays buffered CSI-prefix input after fallback", () => {
+	it("replays buffered CSI-prefix input when it is not a Kitty response", () => {
 		mock.timers.enable({ apis: ["setTimeout"] });
 		const harness = setupNegotiation();
 		try {
 			harness.send("\x1b[");
-			mock.timers.tick(150);
+			mock.timers.tick(50); // StdinBuffer sequence timeout, not the lone-ESC timeout
 
-			assert.equal(harness.writes.includes("\x1b[>4;2m"), true);
 			assert.equal(harness.getInput(), undefined);
 
 			mock.timers.tick(150);
@@ -169,6 +233,26 @@ describe("ProcessTerminal Kitty keyboard protocol negotiation", () => {
 		} finally {
 			harness.cleanup();
 			mock.timers.reset();
+		}
+	});
+});
+
+describe("ProcessTerminal progress", () => {
+	it("writes a valid OSC 9;4 clear sequence", () => {
+		const terminal = new ProcessTerminal();
+		const writes: string[] = [];
+		const previousWrite = process.stdout.write;
+
+		process.stdout.write = ((chunk: string | Uint8Array) => {
+			writes.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write;
+
+		try {
+			terminal.setProgress(false);
+			assert.deepEqual(writes, ["\x1b]9;4;0\x07"]);
+		} finally {
+			process.stdout.write = previousWrite;
 		}
 	});
 });
